@@ -17,6 +17,7 @@ cudaError_t TorchMemorySaver::malloc(
     size_t raw_size,
     const std::string& tag,
     const bool enable_cpu_backup,
+    const CpuBackupKind cpu_backup_kind,
     const bool enable_disk_backup) {
     // Enforce here, not only in the Python layer: an assert is stripped under
     // python -O and bypassed by direct C-API / env-var use.
@@ -30,6 +31,7 @@ cudaError_t TorchMemorySaver::malloc(
         raw_size,
         tag,
         enable_cpu_backup,
+        cpu_backup_kind,
         allocation_metadata_,
         allocator_metadata_mutex_);
 
@@ -65,7 +67,8 @@ cudaError_t TorchMemorySaver::malloc(
         allocation_metadata_.emplace(
             *ptr,
             AllocationMetadata{
-                raw_size, device, tag, AllocationState::ACTIVE, enable_cpu_backup, nullptr,
+                raw_size, device, tag, AllocationState::ACTIVE,
+                enable_cpu_backup, cpu_backup_kind, CpuBackupSlot{},
                 enable_disk_backup, DiskBackupSlot{}, allocation_size, allocHandle}
         );
     }
@@ -84,7 +87,8 @@ cudaError_t TorchMemorySaver::malloc(
 
 cudaError_t TorchMemorySaver::free(void *ptr) {
 #if TMS_ROCM_LEGACY_CHUNKED
-    return ROCmHIPImplementation::rocm_free(ptr, allocation_metadata_, allocator_metadata_mutex_);
+    return ROCmHIPImplementation::rocm_free(
+        ptr, allocation_metadata_, allocator_metadata_mutex_);
 
 #else
     AllocationMetadata metadata;
@@ -104,9 +108,8 @@ cudaError_t TorchMemorySaver::free(void *ptr) {
     CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
     CURESULT_CHECK(cuMemAddressFree((CUdeviceptr) ptr, metadata.allocation_size));
 
-    if (nullptr != metadata.cpu_backup) {
-        CUDA_ERROR_CHECK(cudaFreeHost(metadata.cpu_backup));
-        metadata.cpu_backup = nullptr;
+    if (metadata.enable_cpu_backup) {
+        cpu_backup_release(metadata.cpu_backup_kind, metadata.cpu_backup);
     }
 
     if (metadata.enable_disk_backup) {
@@ -127,7 +130,8 @@ cudaError_t TorchMemorySaver::free(void *ptr) {
 
 void TorchMemorySaver::pause(const std::string& tag) {
 #if TMS_ROCM_LEGACY_CHUNKED
-    ROCmHIPImplementation::rocm_pause(tag, allocation_metadata_, allocator_metadata_mutex_);
+    ROCmHIPImplementation::rocm_pause(
+        tag, allocation_metadata_, allocator_metadata_mutex_);
 
 #else
     const std::lock_guard <std::mutex> lock(allocator_metadata_mutex_);
@@ -149,12 +153,8 @@ void TorchMemorySaver::pause(const std::string& tag) {
         }
 
         if (metadata.enable_cpu_backup) {
-            if (nullptr == metadata.cpu_backup) {
-                CUDA_ERROR_CHECK(cudaMallocHost(&metadata.cpu_backup, metadata.raw_size));
-            }
-            SIMPLE_CHECK(metadata.cpu_backup != nullptr, "cpu_backup should not be nullptr");
-            // TODO may use cudaMemcpyAsync if needed
-            CUDA_ERROR_CHECK(cudaMemcpy(metadata.cpu_backup, ptr, metadata.raw_size, cudaMemcpyDeviceToHost));
+            cpu_backup_offload(metadata.cpu_backup_kind, ptr, metadata.raw_size,
+                               metadata.cpu_backup);
         } else if (metadata.enable_disk_backup) {
             disk_backend_.offload(ptr, metadata.raw_size, metadata.disk);
         }
@@ -178,7 +178,8 @@ void TorchMemorySaver::pause(const std::string& tag) {
 
 void TorchMemorySaver::resume(const std::string& tag) {
 #if TMS_ROCM_LEGACY_CHUNKED
-    ROCmHIPImplementation::rocm_resume(tag, allocation_metadata_, allocator_metadata_mutex_);
+    ROCmHIPImplementation::rocm_resume(
+        tag, allocation_metadata_, allocator_metadata_mutex_);
 
 #else
     const std::lock_guard <std::mutex> lock(allocator_metadata_mutex_);
@@ -209,14 +210,8 @@ void TorchMemorySaver::resume(const std::string& tag) {
         CUDAUtils::cu_mem_set_access(ptr, metadata.allocation_size, metadata.device);
 
         if (metadata.enable_cpu_backup) {
-            SIMPLE_CHECK(metadata.cpu_backup != nullptr, "cpu_backup should not be nullptr");
-            // TODO may use cudaMemcpyAsync if needed
-            CUDA_ERROR_CHECK(cudaMemcpy(ptr, metadata.cpu_backup, metadata.raw_size, cudaMemcpyHostToDevice));
-
-            // TODO may provide a flag to choose whether to free immediately
-            // (users may want to lazily free to reduce re-alloc time)
-            CUDA_ERROR_CHECK(cudaFreeHost(metadata.cpu_backup));
-            metadata.cpu_backup = nullptr;
+            cpu_backup_onload(ptr, metadata.raw_size, metadata.cpu_backup);
+            cpu_backup_release(metadata.cpu_backup_kind, metadata.cpu_backup);
         } else if (metadata.enable_disk_backup) {
             disk_backend_.onload(ptr, metadata.raw_size, metadata.disk);
         }
@@ -259,9 +254,9 @@ uint8_t* TorchMemorySaver::get_cpu_backup_pointer(const uint8_t* query_gpu_ptr, 
             if (metadata.state == AllocationState::ACTIVE) {
                 return nullptr;
             } else {
-                SIMPLE_CHECK(nullptr != metadata.cpu_backup,
+                SIMPLE_CHECK(nullptr != metadata.cpu_backup.data,
                     "get_cpu_backup_pointer: found paused allocation but cpu_backup does not exist, do you forget to enable cpu backup");
-                return (uint8_t*) metadata.cpu_backup + offset;
+                return (uint8_t*) metadata.cpu_backup.data + offset;
             }
         }
     }

@@ -2,6 +2,7 @@ import pytest
 from contextlib import nullcontext
 
 import multiprocessing
+import sys
 import traceback
 import torch
 import torch_memory_saver
@@ -12,6 +13,7 @@ from examples import (
     cuda_graph,
     cuda_vmm_granularity,
     cpu_backup,
+    cpu_backup_rss,
     disk_backup,
     rl_example,
     multi_device,
@@ -36,6 +38,17 @@ def test_cuda_graph(hook_mode):
 @pytest.mark.parametrize("hook_mode", _HOOK_MODES)
 def test_cpu_backup(hook_mode):
     _test_core(cpu_backup.run, hook_mode=hook_mode)
+
+
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.version.hip is not None
+    or sys.platform != "linux",
+    reason="mmap RSS reclaim is CUDA-only; needs Linux /proc",
+)
+def test_cpu_backup_rss(hook_mode):
+    _test_core(cpu_backup_rss.run, hook_mode=hook_mode)
 
 
 @pytest.mark.parametrize("hook_mode", _HOOK_MODES)

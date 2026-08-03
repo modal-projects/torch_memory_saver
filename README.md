@@ -68,6 +68,17 @@ torch_memory_saver.resume()
 assert tensor1[0] == 42, "content is kept unchanged"
 ```
 
+On CUDA, the default host shadow is anonymous `mmap` (`cpu_backup_backend="mmap"`). After resume copies data back to the device, **both** `mmap` and `pinned` host shadows are released (`munmap` / `cudaFreeHost`). Prefer `mmap` when you need process RSS to return reliably; prefer `pinned` when copy latency matters more (reclaim is not promised the same way as mmap).
+
+```python
+with torch_memory_saver.region(enable_cpu_backup=True, cpu_backup_backend="pinned"):
+    ...
+```
+
+ROCm stays pinned-only (`cpu_backup_backend="mmap"` is rejected); host shadows are retained across resume on the legacy ROCm path.
+
+`TMS_INIT_CPU_BACKUP_BACKEND=mmap|pinned` sets the process default for preload / env-driven integrations (mmap is rejected on ROCm); an explicit `cpu_backup_backend=` argument overrides it. On CUDA, `get_cpu_backup` is only valid while allocations are paused — the host shadow is released on resume.
+
 ### Hook Modes
 
 There are two hook modes:

@@ -3,6 +3,7 @@
 #include "api_forwarder.h"
 #include <optional>
 #include "macro.h"
+#include "cpu_backup.h"
 
 // ----------------------------------------------- threadlocal configs --------------------------------------------------
 
@@ -32,6 +33,30 @@ public:
         enable_cpu_backup_ = value;
     }
 
+    // Cached kind, or platform default. Does not parse env (safe for TLS get/restore).
+    CpuBackupKind cpu_backup_kind() {
+        return cpu_backup_kind_.value_or(kDefaultCpuBackupKind);
+    }
+
+    void set_cpu_backup_kind(CpuBackupKind value) {
+        cpu_backup_kind_ = value;
+    }
+
+    // Parse TMS_INIT_CPU_BACKUP_BACKEND once. Only call when enable_cpu_backup is true
+    // so a bad unused env cannot exit(1) on backup-off mallocs.
+    void init_cpu_backup_kind_from_env() {
+        if (cpu_backup_kind_.has_value()) {
+            return;
+        }
+        const char* env = std::getenv("TMS_INIT_CPU_BACKUP_BACKEND");
+        // Empty string is treated as unset (same as Python).
+        if (env == nullptr || env[0] == '\0') {
+            cpu_backup_kind_ = kDefaultCpuBackupKind;
+        } else {
+            cpu_backup_kind_ = parse_cpu_backup_kind(env);
+        }
+    }
+
     bool enable_disk_backup() {
         if (!enable_disk_backup_.has_value()) {
             enable_disk_backup_ = get_bool_env_var("TMS_INIT_ENABLE_DISK_BACKUP");
@@ -46,6 +71,7 @@ public:
 private:
     std::optional<bool> is_interesting_region_;
     std::optional<bool> enable_cpu_backup_;
+    std::optional<CpuBackupKind> cpu_backup_kind_;
     std::optional<bool> enable_disk_backup_;
 };
 static thread_local ThreadLocalConfig thread_local_config;
@@ -55,9 +81,14 @@ static thread_local ThreadLocalConfig thread_local_config;
 #ifdef TMS_HOOK_MODE_PRELOAD
 cudaError_t cudaMalloc(void **ptr, size_t size) {
     if (thread_local_config.is_interesting_region()) {
+        const bool enable_cpu_backup = thread_local_config.enable_cpu_backup();
+        if (enable_cpu_backup) {
+            thread_local_config.init_cpu_backup_kind_from_env();
+        }
         return TorchMemorySaver::instance().malloc(
             ptr, CUDAUtils::cu_ctx_get_device(), size, thread_local_config.current_tag_,
-            thread_local_config.enable_cpu_backup(), thread_local_config.enable_disk_backup());
+            enable_cpu_backup, thread_local_config.cpu_backup_kind(),
+            thread_local_config.enable_disk_backup());
     } else {
         return APIForwarder::call_real_cuda_malloc(ptr, size);
     }
@@ -78,9 +109,14 @@ void *tms_torch_malloc(ssize_t size, int device, cudaStream_t stream) {
 #endif
     SIMPLE_CHECK(thread_local_config.is_interesting_region(), "only support interesting region");
     void *ptr;
+    const bool enable_cpu_backup = thread_local_config.enable_cpu_backup();
+    if (enable_cpu_backup) {
+        thread_local_config.init_cpu_backup_kind_from_env();
+    }
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().malloc(
         &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_,
-        thread_local_config.enable_cpu_backup(), thread_local_config.enable_disk_backup()));
+        enable_cpu_backup, thread_local_config.cpu_backup_kind(),
+        thread_local_config.enable_disk_backup()));
     return ptr;
 }
 
@@ -122,6 +158,14 @@ bool tms_get_enable_cpu_backup() {
 
 void tms_set_enable_cpu_backup(bool enable_cpu_backup) {
     thread_local_config.set_enable_cpu_backup(enable_cpu_backup);
+}
+
+const char* tms_get_cpu_backup_backend() {
+    return thread_local_config.cpu_backup_kind() == CpuBackupKind::MMAP ? "mmap" : "pinned";
+}
+
+void tms_set_cpu_backup_backend(const char* backend) {
+    thread_local_config.set_cpu_backup_kind(parse_cpu_backup_kind(backend));
 }
 
 bool tms_get_enable_disk_backup() {
