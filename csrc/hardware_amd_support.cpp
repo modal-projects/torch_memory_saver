@@ -227,8 +227,10 @@ namespace ROCmHIPImplementation {
             allocation_metadata.erase(ptr);
         }
 
-        // Unmap and release chunks
-        cu_mem_unmap_and_release(metadata.device, metadata.aligned_size, (hipDeviceptr_t)ptr, metadata.allocHandles, metadata.chunk_sizes);
+        // Unmap and release chunks, unless rocm_pause already did it
+        if (AllocationState::ACTIVE == metadata.state) {
+            cu_mem_unmap_and_release(metadata.device, metadata.aligned_size, (hipDeviceptr_t)ptr, metadata.allocHandles, metadata.chunk_sizes);
+        }
 
         // Free the reserved address using stored aligned_size
         CURESULT_CHECK(hipMemAddressFree((hipDeviceptr_t)ptr, metadata.aligned_size));

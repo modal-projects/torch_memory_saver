@@ -18,6 +18,7 @@ from examples import (
     multi_device_torch_mode,
     training_engine,
     nested_region,
+    free_while_paused,
 )
 
 _HOOK_MODES = ["preload", "torch"]
@@ -82,6 +83,15 @@ def test_nested_region():
         change_env("TMS_INIT_ENABLE_CPU_BACKUP", "1")
     ):
         _test_core(nested_region.run, hook_mode="preload")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.cuda is None,
+    reason="Freeing paused memory via the hooked CUDA API requires a CUDA GPU",
+)
+def test_free_while_paused():
+    with change_env("TMS_INIT_ENABLE", "1"):
+        _test_core(free_while_paused.run, hook_mode="preload")
 
 
 def _test_core(fn, hook_mode):
